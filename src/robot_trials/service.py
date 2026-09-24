@@ -234,6 +234,10 @@ class TrialService:
         response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
         try:
             with transaction(self.connection, immediate=True):
+                # BEGIN IMMEDIATE 会等待并发写入者提交，这里能读到全部已提交的幂等记录。
+                replay = self._idempotent_response(scope, idempotency_key, request_digest)
+                if replay is not None:
+                    return replay
                 for item, raw in zip(parsed, rows):
                     self.connection.execute(
                         "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
@@ -257,7 +261,11 @@ class TrialService:
                 )
                 self._audit("batch", batch_id, "observations.imported", actor_id, response)
         except sqlite3.IntegrityError as exc:
-            raise Conflict("来源行重复或幂等键并发冲突") from exc
+            # 事务已经回滚；重新读取已提交的幂等记录，把安全重放与真实来源行冲突区分开。
+            replay = self._idempotent_response(scope, idempotency_key, request_digest)
+            if replay is not None:
+                return replay
+            raise Conflict("来源行重复") from exc
         return response
 
     def request_exclusion(self, actor_id: str, observation_id: int, reason: str) -> dict[str, Any]:
