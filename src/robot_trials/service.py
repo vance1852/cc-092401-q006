@@ -234,9 +234,17 @@ class TrialService:
         response = {"batch_id": batch_id, "inserted": len(parsed), "request_sha256": request_digest}
         try:
             with transaction(self.connection, immediate=True):
+                # 先在 (scope,key) 主键上占位：同键的并发竞争者只会在这里失败，
+                # 且失败时事务尚未插入任何观测，不会触碰来源行唯一约束。
+                # 因而回滚后的重新读取能够区分“安全重放”与“真正的来源行冲突”。
+                self.connection.execute(
+                    "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
+                )
                 for item, raw in zip(parsed, rows):
                     self.connection.execute(
-                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at," 
+                        "INSERT INTO observations(batch_id,source_batch,source_row,robot_id,stratum_key,observed_at,"
                         "metrics_json,content_sha256,imported_by,imported_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (
                             batch_id,
@@ -251,13 +259,14 @@ class TrialService:
                             self._now(),
                         ),
                     )
-                self.connection.execute(
-                    "INSERT INTO idempotency_keys(scope,key,request_sha256,response_json,created_at) VALUES(?,?,?,?,?)",
-                    (scope, idempotency_key, request_digest, canonical_json(response), self._now()),
-                )
                 self._audit("batch", batch_id, "observations.imported", actor_id, response)
         except sqlite3.IntegrityError as exc:
-            raise Conflict("来源行重复或幂等键并发冲突") from exc
+            # 事务已经回滚、写锁已经释放；此时必须按“重新读取已提交状态”判定，
+            # 不能凭触发的约束猜测：同键重放与来源行冲突都会进入此分支。
+            committed = self._idempotent_response(scope, idempotency_key, request_digest)
+            if committed is not None:
+                return committed
+            raise Conflict("来源行重复") from exc
         return response
 
     def request_exclusion(self, actor_id: str, observation_id: int, reason: str) -> dict[str, Any]:
